@@ -30,6 +30,7 @@
     "better-sqlite3": "^12.6.2",
     "cheerio": "^1.2.0",
     "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "^5.4.624",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },

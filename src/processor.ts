@@ -1,11 +1,19 @@
 import * as fs from "fs";
 import * as path from "path";
 import ScheduleDatabase, { ScheduleEntry } from "./database";
-import { PDFParse } from "pdf-parse";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 interface PDFFile {
     name: string;
     path: string;
+}
+
+interface TextItem {
+    text: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
 }
 
 interface ParsedPeriod {
@@ -90,20 +98,14 @@ class PDFProcessor {
     }
 
     /**
-     * Parse PDF text to extract Period entries with their correct day assignments
-     * The PDF text is extracted row-by-row across 5 columns (Mon-Fri).
-     * For each period number, occurrences appear in day order (Mon->Fri), so we
-     * track which day we're on for each period and advance through the week.
+     * Parse PDF text items to extract Period entries with their correct day assignments
+     * Uses x-position to determine which column (day) each period belongs to.
      *
      * Handles duplicate periods due to A/B lunch by:
      * - Period 3: uses B Lunch timing (appears after B Lunch)
      * - Period 4: uses A Lunch timing (appears after A Lunch)
      */
-    parsePeriodsFromText(text: any, dates: Date[]): any {
-        // Extract text string from PDF result object
-        const textStr = typeof text === "string" ? text : text.text || "";
-
-        // First, extract which periods meet each day from the header
+    parsePeriodsFromText(textItems: TextItem[], dates: Date[]): any {
         const dayNames = [
             "Monday",
             "Tuesday",
@@ -111,65 +113,141 @@ class PDFProcessor {
             "Thursday",
             "Friday",
         ];
-        const dayPeriods: Map<number, Set<number>> = new Map();
 
-        for (let dayIdx = 0; dayIdx < dayNames.length; dayIdx++) {
-            const dayName = dayNames[dayIdx];
-            const dayPattern = new RegExp(`${dayName}\\s*\\n([\\d,\\-]+)`, "i");
-            const match = textStr.match(dayPattern);
-            if (match) {
-                const periodsStr = match[1];
-                const periodSet = new Set<number>();
-                if (periodsStr.includes("-") && !periodsStr.includes(",")) {
-                    const [start, end] = periodsStr.split("-").map(Number);
-                    for (let p = start; p <= end; p++) {
-                        periodSet.add(p);
-                    }
-                } else {
-                    periodsStr
-                        .split(",")
-                        .forEach((p: string) =>
-                            periodSet.add(parseInt(p.trim())),
-                        );
-                }
-                dayPeriods.set(dayIdx, periodSet);
-            }
-        }
+        // Find column boundaries by looking for day name headers
+        const dayHeaders = textItems.filter((item) =>
+            dayNames.some((day) => item.text.includes(day)),
+        );
 
-        console.log("\nPeriods per day from header:");
-        dayPeriods.forEach((periods, day) => {
+        console.log("\nDay headers found:");
+        dayHeaders.forEach((h) =>
             console.log(
-                `  ${dayNames[day]}: ${[...periods].sort((a, b) => a - b).join(", ")}`,
-            );
-        });
+                `  ${h.text} at x=${h.x.toFixed(1)}, y=${h.y.toFixed(1)}`,
+            ),
+        );
 
-        // Pattern to match Period entries with time
-        const periodPattern =
-            /Period\s+(\d+)\s*[\n\s]*(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})\s*\(\d+\)/g;
+        // Sort by x position to get column order
+        const columnXPositions = dayHeaders
+            .map((h) => ({ name: h.text, x: h.x }))
+            .sort((a, b) => a.x - b.x);
 
-        // Find all period matches with their positions
+        console.log("\nColumn positions (left to right):");
+        columnXPositions.forEach((col, i) =>
+            console.log(`  Column ${i}: ${col.name} at x=${col.x.toFixed(1)}`),
+        );
+
+        // Group all text items by their approximate column
+        // Use midpoint between columns as boundary
+        const getColumnIndex = (x: number): number => {
+            if (columnXPositions.length === 0) return -1;
+
+            for (let i = columnXPositions.length - 1; i >= 0; i--) {
+                const colX = columnXPositions[i].x;
+                const nextColX =
+                    i < columnXPositions.length - 1
+                        ? columnXPositions[i + 1].x
+                        : Infinity;
+                const boundary = (colX + nextColX) / 2;
+
+                // Item belongs to column i if it's past the midpoint to the previous column
+                const prevBoundary =
+                    i > 0 ? (columnXPositions[i - 1].x + colX) / 2 : -Infinity;
+                if (x >= prevBoundary) {
+                    return i;
+                }
+            }
+            return 0;
+        };
+
+        // Find period entries - look for "Period X" text items
+        const periodItems = textItems.filter((item) =>
+            /^Period\s+\d+$/i.test(item.text.trim()),
+        );
+
+        // Combine text items on the same row (similar y-position) to handle split times
+        const combineRowItems = (
+            items: TextItem[],
+            baseY: number,
+            minX: number,
+            maxX: number,
+        ): string => {
+            const rowItems = items
+                .filter(
+                    (t) =>
+                        Math.abs(t.y - baseY) < 3 && t.x >= minX && t.x <= maxX,
+                )
+                .sort((a, b) => a.x - b.x);
+            return rowItems.map((t) => t.text).join("");
+        };
+
+        console.log(`\nFound ${periodItems.length} period labels`);
+
+        // Associate periods with their times based on proximity (y-position)
         const allMatches: {
             periodNum: number;
             startTime: string;
             endTime: string;
-            index: number;
+            x: number;
+            y: number;
+            columnIndex: number;
         }[] = [];
-        let match;
-        while ((match = periodPattern.exec(textStr)) !== null) {
+
+        for (const periodItem of periodItems) {
+            const periodMatch = periodItem.text.match(/Period\s+(\d+)/i);
+            if (!periodMatch) continue;
+
+            const periodNum = parseInt(periodMatch[1]);
+            const columnIndex = getColumnIndex(periodItem.x);
+
+            // Find column boundaries for limiting search
+            const colStart = columnXPositions[columnIndex]?.x - 40;
+            const colEnd =
+                columnIndex < columnXPositions.length - 1
+                    ? columnXPositions[columnIndex + 1].x - 10
+                    : 600;
+
+            // Look for time on the row just below the period label
+            // Combine all text items on that row within the column
+            const timeRowY = periodItem.y - 13.4; // typical row spacing
+            const combinedText = combineRowItems(
+                textItems,
+                timeRowY,
+                colStart,
+                colEnd,
+            );
+
+            let startTime = "";
+            let endTime = "";
+
+            const timeMatch = combinedText.match(
+                /(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})/,
+            );
+            if (timeMatch) {
+                startTime = timeMatch[1];
+                endTime = timeMatch[2];
+            }
+
             allMatches.push({
-                periodNum: parseInt(match[1]),
-                startTime: match[2],
-                endTime: match[3],
-                index: match.index,
+                periodNum,
+                startTime,
+                endTime,
+                x: periodItem.x,
+                y: periodItem.y,
+                columnIndex,
             });
         }
 
-        console.log(
-            `\nFound ${allMatches.length} total period occurrences in text`,
-        );
+        // Sort by column then by y position (top to bottom)
+        allMatches.sort((a, b) => a.columnIndex - b.columnIndex || b.y - a.y);
+
+        console.log(`\nFound ${allMatches.length} total period occurrences:`);
         allMatches.forEach((period) => {
-            console.log(period);
+            console.log(
+                `  Period ${period.periodNum}: ${period.startTime}-${period.endTime} (column ${period.columnIndex}, x=${period.x.toFixed(1)}, y=${period.y.toFixed(1)})`,
+            );
         });
+
+        return allMatches;
     }
 
     /**
@@ -194,15 +272,35 @@ class PDFProcessor {
     }
 
     /**
-     * Open and parse a single PDF file
+     * Open and parse a single PDF file, extracting text with position info
      */
-    async openPDF(pdfFile: PDFFile): Promise<any> {
+    async openPDF(pdfFile: PDFFile): Promise<TextItem[]> {
         try {
             console.log(`Opening: ${pdfFile.name}`);
-            const parser = new PDFParse({ url: pdfFile.path });
-            const result = await parser.getText();
-            await parser.destroy();
-            return result;
+            const data = new Uint8Array(fs.readFileSync(pdfFile.path));
+            const pdf = await pdfjsLib.getDocument({ data }).promise;
+
+            const textItems: TextItem[] = [];
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+
+                for (const item of textContent.items) {
+                    if ("str" in item && item.str.trim()) {
+                        const transform = item.transform;
+                        textItems.push({
+                            text: item.str,
+                            x: transform[4],
+                            y: transform[5],
+                            width: item.width,
+                            height: item.height,
+                        });
+                    }
+                }
+            }
+
+            return textItems;
         } catch (error) {
             console.error(`Error opening ${pdfFile.name}:`, error);
             throw error;
@@ -210,9 +308,103 @@ class PDFProcessor {
     }
 
     /**
-     * Open all PDFs in the downloads folder
+     * Save parsed periods to the database
+     * Handles duplicates: Period 3 uses first occurrence, Period 4 uses second occurrence
      */
-    async openAllPDFs(): Promise<void> {
+    savePeriodsToDatabase(
+        allMatches: {
+            periodNum: number;
+            startTime: string;
+            endTime: string;
+            x: number;
+            y: number;
+            columnIndex: number;
+        }[],
+        dates: Date[],
+    ): void {
+        const entries: { name: string; startTime: Date; endTime: Date }[] = [];
+
+        // Group by column (day) and period number
+        const byDayAndPeriod = new Map<string, typeof allMatches>();
+        for (const match of allMatches) {
+            const key = `${match.columnIndex}-${match.periodNum}`;
+            if (!byDayAndPeriod.has(key)) {
+                byDayAndPeriod.set(key, []);
+            }
+            byDayAndPeriod.get(key)!.push(match);
+        }
+
+        // Process each day-period combination
+        for (const [key, periods] of byDayAndPeriod) {
+            const [colIdx, periodNum] = key.split("-").map(Number);
+            const date = dates[colIdx];
+            if (!date) continue;
+
+            // Sort by y position (higher y = earlier in document, top of page)
+            periods.sort((a, b) => b.y - a.y);
+
+            // Apply duplicate rules: Period 3 -> first, Period 4 -> second
+            let selected: (typeof periods)[0];
+            if (periodNum === 3) {
+                selected = periods[0]; // first occurrence
+            } else if (periodNum === 4 && periods.length > 1) {
+                selected = periods[1]; // second occurrence
+            } else {
+                selected = periods[0]; // default to first
+            }
+
+            if (!selected.startTime || !selected.endTime) continue;
+
+            // Parse time strings and combine with date
+            const parseTime = (timeStr: string, baseDate: Date): Date => {
+                const [hours, minutes] = timeStr.split(":").map(Number);
+                const result = new Date(baseDate);
+                // Assume times before 7:00 are PM (school hours logic)
+                const adjustedHours = hours < 7 ? hours + 12 : hours;
+                result.setHours(adjustedHours, minutes, 0, 0);
+                return result;
+            };
+
+            entries.push({
+                name: `Period ${periodNum}`,
+                startTime: parseTime(selected.startTime, date),
+                endTime: parseTime(selected.endTime, date),
+            });
+        }
+
+        // Sort entries by start time
+        entries.sort((a, b) => a.startTime.getTime() - b.startTime.getTime());
+
+        console.log(`\nInserting ${entries.length} schedule entries:`);
+        entries.forEach((e) => {
+            console.log(
+                `  ${e.name}: ${e.startTime.toLocaleString()} - ${e.endTime.toLocaleTimeString()}`,
+            );
+        });
+
+        this.db.insertMany(entries);
+    }
+
+    /**
+     * Process a single PDF file and save to database
+     */
+    async processPDF(pdfFile: PDFFile): Promise<void> {
+        const textItems = await this.openPDF(pdfFile);
+        const dates = this.parseDateRange(pdfFile.name);
+        
+        if (dates.length === 0) {
+            console.log(`Skipping ${pdfFile.name} - could not parse dates`);
+            return;
+        }
+
+        const periods = this.parsePeriodsFromText(textItems, dates);
+        this.savePeriodsToDatabase(periods, dates);
+    }
+
+    /**
+     * Process all PDFs and save to database
+     */
+    async processAllPDFs(): Promise<void> {
         const pdfFiles = this.getPDFFiles();
 
         if (pdfFiles.length === 0) {
@@ -220,16 +412,14 @@ class PDFProcessor {
             return;
         }
 
-        console.log(`\n=== Opening ${pdfFiles.length} PDFs ===\n`);
+        console.log(`\n=== Processing ${pdfFiles.length} PDFs ===\n`);
 
         for (const pdfFile of pdfFiles) {
             try {
-                const result = await this.openPDF(pdfFile);
-                console.log(`Successfully opened: ${pdfFile.name}`);
-                console.log(`  - Pages: ${result.pages?.length || "unknown"}`);
-                console.log("");
+                await this.processPDF(pdfFile);
+                console.log(`Successfully processed: ${pdfFile.name}\n`);
             } catch (error) {
-                console.error(`Failed to open: ${pdfFile.name}\n`);
+                console.error(`Failed to process: ${pdfFile.name}`, error);
             }
         }
 
@@ -240,13 +430,7 @@ class PDFProcessor {
 // Main execution
 async function main() {
     const processor = new PDFProcessor();
-    const file: PDFFile = processor.getPDFFiles()[0];
-    console.log(file.name);
-    const text = await processor.openPDF(file);
-    await processor.parsePeriodsFromText(
-        text,
-        processor.parseDateRange(file.name),
-    );
+    await processor.processAllPDFs();
 }
 
 if (require.main === module) {
