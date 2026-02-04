@@ -1,0 +1,39 @@
+{
+  "name": "countdown",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/scraper.ts",
+    "dev": "ts-node src/scraper.ts",
+    "scrape": "ts-node src/scraper.ts",
+    "process": "ts-node src/processor.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aarushth/countdown.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/aarushth/countdown/issues"
+  },
+  "homepage": "https://github.com/aarushth/countdown#readme",
+  "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.2.0",
+    "axios": "^1.13.4",
+    "better-sqlite3": "^12.6.2",
+    "cheerio": "^1.2.0",
+    "pdf-parse": "^2.4.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@types/pdf-parse": "^1.1.5"
+  }
+}
