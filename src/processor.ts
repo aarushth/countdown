@@ -1,6 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
-import ScheduleDatabase, { ScheduleEntry } from "./database";
+import {
+    ScheduleLunchDatabase,
+    ScheduleLunchEntry,
+    LunchType,
+} from "./database";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 
 interface PDFFile {
@@ -16,19 +20,12 @@ interface TextItem {
     height: number;
 }
 
-interface ParsedPeriod {
-    name: string;
-    startTime: string;
-    endTime: string;
-    columnIndex: number;
-}
-
 class PDFProcessor {
     private downloadDir = path.join(__dirname, "../downloads");
-    private db: ScheduleDatabase;
+    private db: ScheduleLunchDatabase;
 
     constructor() {
-        this.db = new ScheduleDatabase();
+        this.db = new ScheduleLunchDatabase();
     }
 
     parseDateRange(filename: string): Date[] {
@@ -97,14 +94,6 @@ class PDFProcessor {
         return dates;
     }
 
-    /**
-     * Parse PDF text items to extract Period entries with their correct day assignments
-     * Uses x-position to determine which column (day) each period belongs to.
-     *
-     * Handles duplicate periods due to A/B lunch by:
-     * - Period 3: uses B Lunch timing (appears after B Lunch)
-     * - Period 4: uses A Lunch timing (appears after A Lunch)
-     */
     parsePeriodsFromText(textItems: TextItem[], dates: Date[]): any {
         const dayNames = [
             "Monday",
@@ -119,22 +108,9 @@ class PDFProcessor {
             dayNames.some((day) => item.text.includes(day)),
         );
 
-        console.log("\nDay headers found:");
-        dayHeaders.forEach((h) =>
-            console.log(
-                `  ${h.text} at x=${h.x.toFixed(1)}, y=${h.y.toFixed(1)}`,
-            ),
-        );
-
-        // Sort by x position to get column order
         const columnXPositions = dayHeaders
             .map((h) => ({ name: h.text, x: h.x }))
             .sort((a, b) => a.x - b.x);
-
-        console.log("\nColumn positions (left to right):");
-        columnXPositions.forEach((col, i) =>
-            console.log(`  Column ${i}: ${col.name} at x=${col.x.toFixed(1)}`),
-        );
 
         // Group all text items by their approximate column
         // Use midpoint between columns as boundary
@@ -240,19 +216,9 @@ class PDFProcessor {
         // Sort by column then by y position (top to bottom)
         allMatches.sort((a, b) => a.columnIndex - b.columnIndex || b.y - a.y);
 
-        console.log(`\nFound ${allMatches.length} total period occurrences:`);
-        allMatches.forEach((period) => {
-            console.log(
-                `  Period ${period.periodNum}: ${period.startTime}-${period.endTime} (column ${period.columnIndex}, x=${period.x.toFixed(1)}, y=${period.y.toFixed(1)})`,
-            );
-        });
-
         return allMatches;
     }
 
-    /**
-     * Get all PDF files from the downloads folder
-     */
     getPDFFiles(): PDFFile[] {
         if (!fs.existsSync(this.downloadDir)) {
             console.log("Downloads directory does not exist");
@@ -271,9 +237,6 @@ class PDFProcessor {
         return pdfFiles;
     }
 
-    /**
-     * Open and parse a single PDF file, extracting text with position info
-     */
     async openPDF(pdfFile: PDFFile): Promise<TextItem[]> {
         try {
             console.log(`Opening: ${pdfFile.name}`);
@@ -307,10 +270,6 @@ class PDFProcessor {
         }
     }
 
-    /**
-     * Save parsed periods to the database
-     * Handles duplicates: Period 3 uses first occurrence, Period 4 uses second occurrence
-     */
     savePeriodsToDatabase(
         allMatches: {
             periodNum: number;
@@ -322,7 +281,12 @@ class PDFProcessor {
         }[],
         dates: Date[],
     ): void {
-        const entries: { name: string; startTime: Date; endTime: Date }[] = [];
+        const entries: {
+            name: string;
+            startTime: Date;
+            endTime: Date;
+            lunch: LunchType;
+        }[] = [];
 
         // Group by column (day) and period number
         const byDayAndPeriod = new Map<string, typeof allMatches>();
@@ -334,6 +298,16 @@ class PDFProcessor {
             byDayAndPeriod.get(key)!.push(match);
         }
 
+        // Parse time strings and combine with date
+        const parseTime = (timeStr: string, baseDate: Date): Date => {
+            const [hours, minutes] = timeStr.split(":").map(Number);
+            const result = new Date(baseDate);
+            // Assume times before 7:00 are PM (school hours logic)
+            const adjustedHours = hours < 7 ? hours + 12 : hours;
+            result.setHours(adjustedHours, minutes, 0, 0);
+            return result;
+        };
+
         // Process each day-period combination
         for (const [key, periods] of byDayAndPeriod) {
             const [colIdx, periodNum] = key.split("-").map(Number);
@@ -343,45 +317,44 @@ class PDFProcessor {
             // Sort by y position (higher y = earlier in document, top of page)
             periods.sort((a, b) => b.y - a.y);
 
-            // Apply duplicate rules: Period 3 -> first, Period 4 -> second
-            let selected: (typeof periods)[0];
-            if (periodNum === 3) {
-                selected = periods[0]; // first occurrence
-            } else if (periodNum === 4 && periods.length > 1) {
-                selected = periods[1]; // second occurrence
+            // For periods 3 and 4 with duplicates, save both A lunch and B lunch
+            if ((periodNum === 3 || periodNum === 4) && periods.length > 1) {
+                // First occurrence is A lunch
+                const aLunch = periods[0];
+                if (aLunch.startTime && aLunch.endTime) {
+                    entries.push({
+                        name: `Period ${periodNum}`,
+                        startTime: parseTime(aLunch.startTime, date),
+                        endTime: parseTime(aLunch.endTime, date),
+                        lunch: LunchType.A_LUNCH,
+                    });
+                }
+                // Second occurrence is B lunch
+                const bLunch = periods[1];
+                if (bLunch.startTime && bLunch.endTime) {
+                    entries.push({
+                        name: `Period ${periodNum}`,
+                        startTime: parseTime(bLunch.startTime, date),
+                        endTime: parseTime(bLunch.endTime, date),
+                        lunch: LunchType.B_LUNCH,
+                    });
+                }
             } else {
-                selected = periods[0]; // default to first
+                // Single occurrence - no lunch variant
+                const selected = periods[0];
+                if (!selected.startTime || !selected.endTime) continue;
+
+                entries.push({
+                    name: `Period ${periodNum}`,
+                    startTime: parseTime(selected.startTime, date),
+                    endTime: parseTime(selected.endTime, date),
+                    lunch: LunchType.NONE,
+                });
             }
-
-            if (!selected.startTime || !selected.endTime) continue;
-
-            // Parse time strings and combine with date
-            const parseTime = (timeStr: string, baseDate: Date): Date => {
-                const [hours, minutes] = timeStr.split(":").map(Number);
-                const result = new Date(baseDate);
-                // Assume times before 7:00 are PM (school hours logic)
-                const adjustedHours = hours < 7 ? hours + 12 : hours;
-                result.setHours(adjustedHours, minutes, 0, 0);
-                return result;
-            };
-
-            entries.push({
-                name: `Period ${periodNum}`,
-                startTime: parseTime(selected.startTime, date),
-                endTime: parseTime(selected.endTime, date),
-            });
         }
 
         // Sort entries by start time
         entries.sort((a, b) => a.startTime.getTime() - b.startTime.getTime());
-
-        console.log(`\nInserting ${entries.length} schedule entries:`);
-        entries.forEach((e) => {
-            console.log(
-                `  ${e.name}: ${e.startTime.toLocaleString()} - ${e.endTime.toLocaleTimeString()}`,
-            );
-        });
-
         this.db.insertMany(entries);
     }
 
@@ -391,7 +364,7 @@ class PDFProcessor {
     async processPDF(pdfFile: PDFFile): Promise<void> {
         const textItems = await this.openPDF(pdfFile);
         const dates = this.parseDateRange(pdfFile.name);
-        
+
         if (dates.length === 0) {
             console.log(`Skipping ${pdfFile.name} - could not parse dates`);
             return;
@@ -401,9 +374,6 @@ class PDFProcessor {
         this.savePeriodsToDatabase(periods, dates);
     }
 
-    /**
-     * Process all PDFs and save to database
-     */
     async processAllPDFs(): Promise<void> {
         const pdfFiles = this.getPDFFiles();
 
